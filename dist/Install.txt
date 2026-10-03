@@ -1,0 +1,48 @@
+BATOCERA:
+
+Apertar F1 para acessar o explorador de arquivos
+do Batocera, ir em /userdata/roms e criar a pasta
+"next", depois copiar o arquivo zxnext.next
+
+Copiar o arquivo: es_systems_zxnext.cfg 
+para /userdata/system/configs/emulationstation
+---------------------------------------------------
+Em: /userdata/system abrir o arquivo: batocera.conf
+e copiar essas 2 linhas no final do arquivo:
+zxnext.emulator=libretro
+zxnext.core=zxnext
+---------------------------------------------------
+Copiar o arquivo zxnext_libretro.info dentro da pasta
+/usr/share/libretro/info
+---------------------------------------------------
+Coloque os arquivos tbblue_loader.rom e tbblue.mmc
+em /userdata/bios/zesarux/
+---------------------------------------------------
+Copiar o arquivo: next_libretro.so dentro da pasta
+/usr/lib/libretro e por fim no Explorador de
+arquivos apertar F4 para o CMD e digitar:
+chmod 755 /usr/lib/libretro/zxnext_libretro.so
+batocera-save-overlay
+Reiniciar!
+
+Obs.: Se os botões do menu do Retroarch estiverem
+errados copiar o arquivo: zxnext.keys para ->
+/userdata/system/configs/evmapy
+
+===================================================
+
+RETROARCH / WINDOWS:
+
+Copiar o arquivo: next_libretro.dll para dentro
+da pasta: \RetroArch\cores
+
+Copiar os arquivos tbblue_loader.rom e tbblue.mmc
+em /bios/zesarux/
+
+Copiar o arquivo: next_libretro.info para dentro
+da pasta: \RetroArch\info
+
+Apagar este arquivo para atualizar a lista de cores!
+RetroArch\info\core_info.cache
+
+Fechar e abrir novamente o Retroarch!
