@@ -1,0 +1,2 @@
+cd /g/Internet_Temp/Batocera_add/Projetos/next
+powershell -ExecutionPolicy Bypass -File ./build/build_win.ps1

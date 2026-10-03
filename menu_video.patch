@@ -1,0 +1,59 @@
+--- v/scr_libretro.c.orig	2026-10-02 19:02:03.275750973 +0000
++++ v/scr_libretro.c	2026-10-02 19:02:03.334421046 +0000
+@@ -10,11 +10,10 @@
+  * recebe a cor convertido para RGB -- assim nao precisamos da tabela de
+  * indices do Spectrum.
+  *
+- * Diferenca importante em relacao ao ZEsarUX original: aqui nao desenhamos
+- * nenhuma janela e nao temos overlay de menu. O RetroArch cuida de tudo
+- * nisso. Por isso NAO chamamos screen_render_menu_overlay_if_active() nem
+- * draw_middle_footer(), que scrtemplate chama e que so fariam sentido se
+- * fossemos desenhar a interface do ZXVision dentro do nosso framebuffer.
++ * Menu: o menu do ZEsarUX (tecla F8) e o teclado virtual (botao X) rodam numa
++ * thread propria (ver zesarux_glue.c) e sao desenhados por este driver, no
++ * proprio framebuffer, via screen_render_menu_overlay_if_active() e
++ * draw_middle_footer() -- as mesmas chamadas do scrtemplate.
+  */
+ 
+ #include <stdlib.h>
+@@ -333,9 +332,10 @@
+ 
+     sem_screen_refresh_reallocate_layers = 1;
+ 
+-    /* scrtemplate tambem chama screen_render_menu_overlay_if_active() e
+-     * draw_middle_footer() aqui. Nao copiamos: sao o menu do ZXVision, que o
+-     * RetroArch substitui pelo seu proprio. */
++    /* Este refresh pode rodar na thread do frontend (fim de quadro) ou na do
++     * menu (menu_refresca_pantalla). O retro_run entrega o framebuffer ao
++     * frontend sob o mesmo lock, entao nunca se le um quadro pela metade. */
++    zx_fb_lock();
+ 
+     if (MACHINE_IS_ZX8081)
+         scrlibretro_refresca_pantalla_zx81();
+@@ -374,6 +374,12 @@
+         scr_refresca_pantalla_y_border_pcw();
+     }
+ 
++    /* Menu / teclado virtual / rodape: so desenham se o overlay estiver ativo. */
++    screen_render_menu_overlay_if_active();
++    draw_middle_footer();
++
++    zx_fb_unlock();
++
+     sem_screen_refresh_reallocate_layers = 0;
+ 
+ #ifdef ZX_TRACE_CUSTO
+--- v/scr_libretro.h.orig	2026-10-02 19:02:03.276792254 +0000
++++ v/scr_libretro.h	2026-10-02 19:02:03.334592585 +0000
+@@ -21,6 +21,11 @@
+ const uint32_t *zx_libretro_framebuffer(unsigned *width, unsigned *height,
+                                          size_t *pitch_bytes);
+ 
++/* Lock do framebuffer, definido em zesarux_glue.c. Quem escreve no buffer
++ * (este driver) e quem o entrega ao frontend (retro_run) trava o mesmo mutex. */
++void zx_fb_lock(void);
++void zx_fb_unlock(void);
++
+ #endif
+ 
+ #ifdef ZX_TRACE_CAIXA
