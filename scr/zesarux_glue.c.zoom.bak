@@ -1,0 +1,1373 @@
+﻿/*
+ * zesarux_glue.c - camada entre o core libretro e o codigo do ZEsarUX.
+ *
+ * Este e o arquivo real (o zesarux_glue_stub.c e so um desenho animado para
+ * validar o lado libretro sem emular nada).
+ *
+ * -----------------------------------------------------------------------
+ * COMO O ZESARUX SEGUIR FUNCIONA, e o que este arquivo respeita
+ * -----------------------------------------------------------------------
+ *
+ * 1. DRIVERS DE VIDEO E AUDIO SAO PONTEIROS.
+ *    audio.c:101   void (*audio_send_frame) (char *buffer);
+ *    screen.h:68   void (*scr_putpixel) (int x,int y,unsigned int color);
+ *    O emulador chama a funcao que estiver apontada. Nos trocamos os ponteiros
+ *    em vez de reescrever o emulador -- e o mesmo mecanismo que o audionull.c
+ *    e o scrnull.c usam.
+ *
+ * 2. UM PASSO DE CPU, NAO UM LACO.
+ *    start.c:380   void emulator_main_loop(void) {
+ *                      while (1) {
+ *                          while (menu_abierto==0 && ending_emulator_flag==0) {
+ *                              cpu_core_loop();     <-- um passo
+ *                          }
+ *    cpu_core_loop() NAO tem while dentro. Quem itera e o start.c. E o
+ *    cpu_core_loop_spectrum() (cores/core_spectrum.c:1045) tambem nao tem
+ *    laco: e um passo de instrucao. Entao o port nao precisa mexer no laco
+ *    principal nem isolar nada -- basta chamar cpu_core_loop() N vezes.
+ *
+ * 3. O FIM DE QUADRO TEM UMA FLAG.
+ *    core_spectrum.c:423   esperando_tiempo_final_t_estados.v = 1;
+ *    cpu.c:1049            esperando_tiempo_final_t_estados.v = 0;  (no reset)
+ *    1 = chegou ao fim do quadro mas o timer ainda nao gerou a interrupcao.
+ *    0 = quadro fechado. E o sinal de "este quadro terminou".
+ *
+ * 4. A TELA SE DESENHA DE DENTRO DO PASSO.
+ *    screen.c:10219   scr_refresca_pantalla();   chamado pelo proprio
+ *    emulador quando decide refreshar. Nos nao chamamos: interceptamos
+ *    scr_putpixel e o framebuffer se preenche sozinho.
+ *
+ * 5. A MAQUINA SE ESCOLHE POR NOME.
+ *    utils.c:13389   {"TBBlue",19,...}   em machines_short_names_id[]
+ *    set_machine_type_by_name("TBBlue")   (utils.c:13502)
+ *    Atencao ao nome: "TBBlue", com as duas maiusculas, nao "next" nem
+ *    "tbblue".
+ *
+ * 6. A TAXA DE AUDIO E VARIAVEL.
+ *    audio.h:52   #define FRECUENCIA_SONIDO frecuencia_sonido_variable
+ *    Ver o comentario em snd_libretro.c. O av_info precisa refletir isto.
+ */
+
+#include <stdio.h>
+#include <math.h>   /* sqrt, para a correlacao do [corr] */
+#include <stdlib.h>
+#include <string.h>
+
+#include "cpu.h"
+#include "start.h"
+#include "screen.h"
+#include "audio.h"
+#include "debug.h"
+#include "settings.h"
+#include "menu_items.h"
+#include "chardevice.h"
+#include "timer.h"      /* init_timer, timer.h:70  */
+#include "ay38912.h"    /* init_chip_ay, ay_init_filters  */
+#include "sn76489an.h"  /* init_chip_sn, sn_init_filters  */
+#include "ulaplus.h"    /* init_ulaplus_table  */
+#include "prism.h"      /* init_prism_palettes  */
+#include "tape.h"       /* init_visual_real_tape  */
+#include "cpc.h"        /* init_cpc_line_display_table  */
+#include "contend.h"    /* inicializa_tabla_contend_speed_higher  */
+#include "operaciones.h"/* init_cpu_tables, init_visualmembuffer  */
+#include "realjoystick.h"/* realjoystick_init, realjoystick_main  */
+#include "tbblue.h"      /* tbblue_fpga_rom  */
+#include "mmc.h"        /* mmc_file_name, mmc_enabled, mmc_enable  */
+#include "divmmc.h"     /* divmmc_*_enabled, divmmc_*_enable/disable  */
+#include "joystick.h"
+#include "libretro.h"    /* RETROK_*, RETRO_DEVICE_ID_JOYPAD_*  */
+
+#include "video/scr_libretro.h"
+#include "audio/snd_libretro.h"
+
+#include "zesarux_glue.h"
+
+/* ------------------------------------------------------- estado do core --- */
+
+static bool  zx_started;
+static bool  zx_paused = true;
+static bool  zx_wants_pause;
+static double zx_fps_override;
+
+/* O ZEsarUX mantem o estado global da maquina em variaveis estaticas
+ * espalhadas. Nao ha estrutura de contexto para instanciar, entao usamos
+ * essas variaveis diretamente.
+ *
+ * NAO redeclaramos aqui: cpu.h:247 ja diz  extern z80_byte current_machine_type
+ * e cpu.h:307 diz      extern z80_bit esperando_tiempo_final_t_estados.
+ * Declarar de novo com 'int' da conflito de tipo -- e o compilador esta
+ * certo em reclamar. O codigo do ZEsarUX e bem cuidado com os tipos. */
+
+/* ----------------------------------------------------- montagem do av --- */
+
+void zx_get_av_info(zx_av_info *info)
+{
+    memset(info, 0, sizeof(*info));
+
+    /* O av_info anuncia o DESKTOP do Next, que e' 1280x960 -- o mesmo tamanho do
+     * framebuffer. E' medido, nao suposto: com ZX_TRACE_CAIXA o emulador
+     * escreve de x=0 a 1279 e de y=0 a 959, ou seja, preenche o buffer
+     * inteiro, sem offset e sem zoom.
+     *
+     * Eu announcei antes a JANELA do Spectrum, via
+     * screen_get_emulated_display_width_no_zoom_border_en(), que para o
+     * TBBLUE devolve 704 (= 512 + 96*2, a largura da janela mais a borda).
+     * Isso e' errado para o libretro: 704x608 faz o frontend mostrar so o
+     * canto superior esquerdo de uma imagem de 1280x960, e o resultado e'
+     * a tela cortada -- a borda aparecia so em cima e a esquerda.
+     *
+     * O ZEsarUX ja posiciona as camadas dentro do desktop; quem recorta e'
+     * o frontend, quando lhe damos um tamanho menor que a imagem. */
+    info->width      = 1216;
+    info->height     = 912;
+    info->max_width  = 1408;
+    info->max_height = 1216;
+
+    /* O ZEsarUX corre a 50 Hz na Europa. A opcao de core 60 Hz existe, mas
+     * o hardware do Next e de 50 Hz; 60 so faz sentido se o usuario forcar. */
+    info->fps = zx_fps_override > 0.0 ? zx_fps_override : 50.0;
+
+    /* Taxa real lida de frecuencia_sonido_variable. Se announce 44100 fixo e
+     * a maquina rodar a outra velocidade, o audio sai com o pitch errado --
+     * isso aparece como chiado, nao como erro. */
+    info->sample_rate = (double)snd_libretro_sample_rate();
+
+    info->aspect = 0.0f;   /* 0 = usar width/height */
+}
+
+/* ----------------------------------------------------------- ciclo de vida --- */
+
+static void zx_choose_machine(void)
+{
+    /* "TBBlue" e o nome exato na tabela machines_short_names_id
+     * (utils.c:13389). Nao existe "next" nem "tbblue" em minusculas. */
+    if (set_machine_type_by_name("TBBlue"))
+        debug_printf(VERBOSE_ERR, "[libretro] nao reconheci a maquina TBBlue\n");
+    else
+        strcpy(running_machine_hardware_name, "ZX Spectrum Next");
+}
+
+/* ---------------------------------------------------- onde esta o Next ---
+ *
+ * O ROM da maquina 19 nao e' um .fw e' o tbblue_loader.rom:
+ *
+ *   cpu.c:3263    case 19:
+ *   cpu.c:3264        if (tbblue_fast_boot_mode.v) romfilename="48.rom";
+ *   cpu.c:3265        else romfilename="tbblue_loader.rom";
+ *
+ * E o SD (NextZXOS, com o firmware) e' um arquivo .mmc:
+ *
+ *   menu_items_storage.c:12144   if (find_sharedfile("tbblue.mmc",buffer_nombre))
+ *
+ * Os dois passam por find_sharedfile (utils.c:1254), que procura em ordem:
+ *
+ *   1. o diretorio atual (cwd)
+ *   2. ../Resources/
+ *   3. $INSTALL_PREFIX/share/zesarux/
+ *   4. zesarux_path_location
+ *
+ * A 4a e a nossa. Num executavel normal o ZEsarUX a preenche com a pasta do
+ * proprio binario (start.c:8330, util_get_dir(main_argv[0],...)). Num core
+ * libretro nao existe main_argv: ela continua vazia, e nenhum dos quatro
+ * caminhos leva aonde os arquivos estao.
+ *
+ * Entao apontamos direto. E o gancho oficial, nao um truque: e a mesma variavel
+ * que o ZEsarUX usa, so que preenchida por nos em vez do executavel.
+ */
+static char zx_rom_dir[PATH_MAX];
+
+/* true se tbblue.mmc foi encontrado ao lado do tbblue_loader.rom. Usado por
+ * retro_load_game() para avisar o usuario claramente (log + mensagem na
+ * tela) em vez da tela vazia sem explicacao que o core dava antes. */
+static bool zx_sd_found = false;
+
+bool zx_has_sd(void)
+{
+    return zx_sd_found;
+}
+
+/* --------------------------------------------------- medicao de tempo ---
+ *
+ * Mede o custo por quadro e guarda media E pior caso. O pior caso e o que
+ * importa: o ZEsarUX nem sempre redesenha o quadro inteiro, e a contagem de
+ * pixels ja variou tres ordens de grandeza entre quadros consecutivos. Uma
+ * media esconde justamente os quadros caros.
+ *
+ * 300 quadros e' ~6 segundos de emulacao a 50 Hz, o bastante para o pior
+ * caso aparecer sem deixar o teste longo. */
+#ifdef ZX_TRACE_TEMPO
+#define ZX_TEMPO_QUADROS 1000
+
+static long long zx_tempo_t0;
+static unsigned   zx_tempo_n;      /* passos de CPU do quadro atual */
+static unsigned   zx_tempo_contador;
+
+static unsigned zx_tempo_total_us;
+static unsigned zx_tempo_pior_us;
+static unsigned zx_tempo_pior_pixels;
+static unsigned zx_tempo_pior_passos;
+static unsigned long long zx_tempo_soma_pixels;
+static unsigned zx_tempo_quadros_com_poucos_pixels;
+static int zx_turbo_max;   /* maior cpu_turbo_speed visto: liga turbo durante o jogo? */
+
+static long long zx_agora_us(void)
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (c.QuadPart * 1000000LL) / f.QuadPart;
+}
+
+/* Guarda por quadro, para mediana e p95 -- a media esconde o gargalo, e o
+ * p95 mostra o quanto o orcamento de 20 ms esta sendo estourado. */
+static unsigned zx_hist_us[ZX_TEMPO_QUADROS];
+static unsigned zx_hist_indice[ZX_TEMPO_QUADROS];   /* indice do quadro */
+static unsigned zx_hist_px[ZX_TEMPO_QUADROS];      /* pixels escritos */
+static unsigned zx_hist_passos[ZX_TEMPO_QUADROS];  /* N, passos de CPU */
+static unsigned char zx_hist_turbo[ZX_TEMPO_QUADROS]; /* cpu_turbo_speed */
+#ifdef ZX_TRACE_CUSTO
+static unsigned zx_hist_refresh[ZX_TEMPO_QUADROS]; /* us de video por quadro */
+/* Contadores do driver de video (video/scr_libretro.c). Sao globais la
+ * porque o driver e' quem mede; aqui so leio para o relatorio. */
+extern unsigned long long zx_custo_fim_us;    /* acumulado do refresh */
+extern unsigned long long zx_custo_ref0;      /* inicio do quadro atual */
+extern unsigned long long zx_custo_chamadas;  /* chamadas ao putpixel */
+extern unsigned long long zx_custo_falhas_pg; /* page faults por quadro */
+extern unsigned long long zx_custo_pg0;       /* page faults no inicio */
+unsigned long long zx_falhas_pg_agora(void);  /* definida no driver */
+#endif
+#if defined(ZX_TRACE_CUSTO) || defined(ZX_CONTAR_TIMER)
+/* Quantas vezes por quadro o gerador de interrupcao foi consultado, e quantas
+ * vezes ele foi ao RELOGIO DE PAREDE (gettimeofday dentro do laco de CPU).
+ * Defined em timer.c. */
+extern unsigned long long zx_contador_timer_thread;
+extern unsigned long long zx_contador_timer_nothread;
+/* Base dos deltas por quadro, lida no INICIO de cada quadro. */
+static unsigned long long zx_contador_timer_base[2];
+static unsigned long long zx_ct_total, zx_ct_max;   /* consultas ao gerador */
+static unsigned long long zx_cg_total, zx_cg_max;   /* gettimeofday */
+static unsigned long long zx_cg_quadros_com_gtod;   /* quadros que o chamaram */
+#endif
+static int      zx_hist_n;
+
+/* Os 10 primeiros quadros pagam o primeiro desenho do zero (1.228.800
+ * pixels) e a warming de cache. Isso NAO e' um problema de jogabilidade,
+ * entao entra na media e distorce a leitura. Por isso separo. */
+#define ZX_DESCARTE 10
+
+static void zx_tempo_registra(unsigned passos, long long t0)
+{
+    long long d = zx_agora_us() - t0;
+    /* Contagem de pixels so' existe no build com ZX_TRACE_CAIXA (a caixa e'
+     * rastreada no driver de video). Nos outros builds vale 0 -- e o relatorio
+     * de pixels simplesmente nao aparece, que e' o certo: sem o rastreamento
+     * esse numero nao diria nada. */
+#ifdef ZX_TRACE_CAIXA
+    unsigned px = zx_caixa_pixels();
+#else
+    unsigned px = 0;
+#endif
+
+#ifdef ZX_TRACE_CUSTO
+    extern unsigned long long zx_custo_fim_us;
+    /* O delta do refresh e' do INICIO do quadro (ver zx_run_frame) ate aqui.
+     * A primeira versao tirava o ref0 dentro desta funcao, e como o refresh
+     * ja tinha terminado, o delta dava sempre zero -- por isso a correlacao
+     * com "refresh" saiu r=0.000, que era artefato da medicao. */
+    unsigned long long ref0 = zx_custo_ref0;
+    unsigned long long fpg = zx_falhas_pg_agora() - zx_custo_pg0;
+#endif
+
+    zx_tempo_total_us += (unsigned)d;
+    zx_tempo_soma_pixels += px;
+    if (px < 10000) zx_tempo_quadros_com_poucos_pixels++;
+    if ((unsigned)d > zx_tempo_pior_us)
+    {
+        zx_tempo_pior_us = (unsigned)d;
+        zx_tempo_pior_pixels = px;
+        zx_tempo_pior_passos = passos;
+    }
+    if (cpu_turbo_speed > zx_turbo_max) zx_turbo_max = cpu_turbo_speed;
+    zx_tempo_contador++;
+
+    if (zx_tempo_contador <= ZX_TEMPO_QUADROS)
+    {
+        zx_hist_us[zx_tempo_contador - 1] = (unsigned)d;
+        zx_hist_indice[zx_tempo_contador - 1] = zx_tempo_contador;
+        zx_hist_px[zx_tempo_contador - 1] = px;
+        zx_hist_passos[zx_tempo_contador - 1] = passos;
+        zx_hist_turbo[zx_tempo_contador - 1] = (unsigned char)cpu_turbo_speed;
+#ifdef ZX_TRACE_CUSTO
+        zx_hist_refresh[zx_tempo_contador - 1] = (unsigned)(zx_custo_fim_us - ref0);
+        /* Acumula aqui, e nao no refresh: o refresh pode ser chamado mais de
+         * uma vez por quadro, e ai o delta de page faults sairia errado. */
+        zx_custo_falhas_pg += fpg;
+#endif
+#if defined(ZX_TRACE_CUSTO) || defined(ZX_CONTAR_TIMER)
+        /* Acumula o delta do contador do timer DESTE quadro. A base e' lida no
+         * INICIO do quadro (zx_run_frame): se for lida aqui, o quadro ja
+         * terminou e o delta da zero.
+         *
+         * NAO imprimir nada aqui. No Windows stderr nao e' bufferizado, e um
+         * write por quadro custa milissegundos -- foi o que inflou todas as
+         * medicoes anteriores e me levou a conclusão errada de que a emulação
+         * estourava o orçamento. O resumo sai uma vez, no relatório. */
+        {
+            unsigned long long dc = zx_contador_timer_thread - zx_contador_timer_base[0];
+            unsigned long long dg = zx_contador_timer_nothread - zx_contador_timer_base[1];
+            zx_ct_total += dc;
+            zx_cg_total += dg;
+            if (dc > zx_ct_max) zx_ct_max = dc;
+            if (dg > zx_cg_max) zx_cg_max = dg;
+            if (dg > 0) zx_cg_quadros_com_gtod++;
+            zx_contador_timer_base[0] = zx_contador_timer_thread;
+            zx_contador_timer_base[1] = zx_contador_timer_nothread;
+        }
+#endif
+        zx_hist_n = (int)zx_tempo_contador;
+    }
+
+    if (zx_tempo_contador >= ZX_TEMPO_QUADROS)
+    {
+        /* Sort do historico, descartando os ZX_DESCARTE primeiros quadros.
+         *
+         * Descartar importa: os primeiros quadros pagam o primeiro desenho do
+         * zero (1.228.800 pixels) e a warming de cache. Isso NAO e' problema
+         * de jogabilidade, mas entra na media e faz o numero parecer pior do
+         * que e. */
+        int a, b, ini = ZX_DESCARTE, n2 = zx_hist_n - ZX_DESCARTE;
+        unsigned tmp_us[ZX_TEMPO_QUADROS], tmp_ix[ZX_TEMPO_QUADROS];
+        unsigned tmp_px[ZX_TEMPO_QUADROS], tmp_ps[ZX_TEMPO_QUADROS];
+        unsigned char tmp_tb[ZX_TEMPO_QUADROS];
+#ifdef ZX_TRACE_CUSTO
+        unsigned tmp_rf[ZX_TEMPO_QUADROS];
+#endif
+
+        for (a = 0; a < n2; a++)
+        {
+            tmp_us[a] = zx_hist_us[ini + a];
+            tmp_ix[a] = zx_hist_indice[ini + a];
+            tmp_px[a] = zx_hist_px[ini + a];
+            tmp_ps[a] = zx_hist_passos[ini + a];
+            tmp_tb[a] = zx_hist_turbo[ini + a];
+#ifdef ZX_TRACE_CUSTO
+            tmp_rf[a] = zx_hist_refresh[ini + a];
+#endif
+        }
+        for (a = 1; a < n2; a++)
+        {
+            unsigned v = tmp_us[a], vi = tmp_ix[a], vp = tmp_px[a], vs = tmp_ps[a];
+            unsigned char vt = tmp_tb[a];
+#ifdef ZX_TRACE_CUSTO
+            unsigned vr = tmp_rf[a];
+#endif
+            for (b = a - 1; b >= 0 && tmp_us[b] > v; b--)
+            {
+                tmp_us[b + 1] = tmp_us[b];
+                tmp_ix[b + 1] = tmp_ix[b];
+                tmp_px[b + 1] = tmp_px[b];
+                tmp_ps[b + 1] = tmp_ps[b];
+                tmp_tb[b + 1] = tmp_tb[b];
+#ifdef ZX_TRACE_CUSTO
+                tmp_rf[b + 1] = tmp_rf[b];
+#endif
+            }
+            tmp_us[b + 1] = v;
+            tmp_ix[b + 1] = vi;
+            tmp_px[b + 1] = vp;
+            tmp_ps[b + 1] = vs;
+            tmp_tb[b + 1] = vt;
+#ifdef ZX_TRACE_CUSTO
+            tmp_rf[b + 1] = vr;
+#endif
+        }
+
+        fprintf(stderr, "[tempo] %d quadros (descartados os %d primeiros): "
+                        "mediana %u  p95 %u  p99 %u  pior %u us   orcamento 20000\n",
+                n2, ZX_DESCARTE,
+                tmp_us[n2 / 2], tmp_us[(n2 * 95) / 100],
+                tmp_us[(n2 * 99) / 100], tmp_us[n2 - 1]);
+
+        /* Os 5 piores, com o indice. Se o pior for o quadro 0 ou 1, ele e'
+         * o primeiro desenho do zero e nao afeta a jogabilidade; se estiver
+         * espalhado pelo meio da execucao, o estouro e' real. */
+        fprintf(stderr, "[tempo] os 5 piores (indice=us  pixels  passos  turbo): ");
+        for (a = 0; a < 5 && a < n2; a++)
+            fprintf(stderr, "%u=%u us %u px %u passos t%d  ",
+                    tmp_ix[n2 - 1 - a], tmp_us[n2 - 1 - a], tmp_px[n2 - 1 - a],
+                    tmp_ps[n2 - 1 - a], tmp_tb[n2 - 1 - a]);
+        fprintf(stderr, "\n");
+
+        /* O turbo por quadro: o 'turbo=4' lido logo apos a carga era estado
+         * do boot do NextZXOS, nao propriedade do jogo. Aqui vai a distribuicao
+         * real, para saber se ele muda durante a execucao. */
+        {
+            int t, conta[17];
+            for (t = 0; t <= 16; t++) conta[t] = 0;
+            for (a = 0; a < n2; a++)
+                if (tmp_tb[a] <= 16) conta[tmp_tb[a]]++;
+            fprintf(stderr, "[tempo] turbo por quadro:");
+            for (t = 1; t <= 16; t++)
+                if (conta[t]) fprintf(stderr, "  %dx%dMHz=%d", t, t * 35 / 10, conta[t]);
+            if (conta[0]) fprintf(stderr, "  turbo0=%d", conta[0]);
+            fprintf(stderr, "\n");
+        }
+
+        /* Passos (N) no quadro tipico: se subiu junto com o turbo, o custo
+         * de CPU e' o dominante; se ficou em ~10 mil, o que custa e' o desenho. */
+        fprintf(stderr, "[tempo] passos: mediana %u  min %u  max %u\n",
+                tmp_ps[n2 / 2], tmp_ps[0], tmp_ps[n2 - 1]);
+
+#ifdef ZX_TRACE_CUSTO
+        /* Regressao simples: o que explica o tempo do quadro -- passos de
+         * CPU, pixels escritos, ou o refresh de video medido?
+         *
+         * Uso r = cov(x,y)/(desv(x)*desv(y)). Perto de 1 = explica bem a
+         * variancia; perto de 0 = nao explica nada. E' um indicador, nao
+         * prova -- mas a leitura e' agora sobre componentes medidos, e nao
+         * sobre dois quadros escolhidos a mao. */
+        {
+            double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+            const char *nome[3] = { "passos de CPU", "pixels escritos", "refresh (medido)" };
+            double vx[3];
+            int k;
+            for (k = 0; k < 3; k++)
+            {
+                double ax = 0;
+                for (a = 0; a < n2; a++)
+                    ax += (k == 0) ? (double)tmp_ps[a] : (k == 1) ? (double)tmp_px[a] : (double)tmp_rf[a];
+                vx[k] = ax / n2;
+            }
+            for (a = 0; a < n2; a++)
+            {
+                double y = (double)tmp_us[a];
+                sy += y; syy += y * y;
+                for (k = 0; k < 3; k++)
+                {
+                    double dx = ((k == 0) ? (double)tmp_ps[a] : (k == 1) ? (double)tmp_px[a] : (double)tmp_rf[a]) - vx[k];
+                    sx += dx * dx;
+                }
+            }
+            for (k = 0; k < 3; k++)
+            {
+                double ax = 0, ay = 0, axy = 0;
+                for (a = 0; a < n2; a++)
+                {
+                    double x = (k == 0) ? (double)tmp_ps[a] : (k == 1) ? (double)tmp_px[a] : (double)tmp_rf[a];
+                    double y = (double)tmp_us[a];
+                    ax += x; ay += y; axy += x * y;
+                }
+                double cov = axy / n2 - (ax / n2) * (ay / n2);
+                double dx = sqrt(sx / n2), dy = sqrt((syy / n2 - (sy / n2) * (sy / n2)));
+                fprintf(stderr, "[corr] tempo vs %-18s  r = %+.3f   (x medio %.0f)\n",
+                    nome[k], (dx > 0 && dy > 0) ? cov / (dx * dy) : 0.0, vx[k]);
+            }
+            fprintf(stderr, "[corr] media dos 3: ");
+            {
+                double soma = 0;
+                for (k = 0; k < 3; k++)
+                {
+                    double ax = 0, ay = 0, axy = 0;
+                    for (a = 0; a < n2; a++)
+                    {
+                        double x = (k == 0) ? (double)tmp_ps[a] : (k == 1) ? (double)tmp_px[a] : (double)tmp_rf[a];
+                        double y = (double)tmp_us[a];
+                        ax += x; ay += y; axy += x * y;
+                    }
+                    double cov = axy / n2 - (ax / n2) * (ay / n2);
+                    double dx = sqrt(sx / n2), dy = sqrt(syy / n2 - (sy / n2) * (sy / n2));
+                    soma += (dx > 0 && dy > 0) ? cov / (dx * dy) : 0.0;
+                }
+                fprintf(stderr, "%+.3f\n", soma / 3.0);
+            }
+        }
+#endif
+
+        fprintf(stderr, "[tempo] turbo agora=%d max visto=%d  velocidade=%d%%  passos do pior=%u\n",
+                cpu_turbo_speed, zx_turbo_max, porcentaje_velocidad_emulador,
+                zx_tempo_pior_passos);
+
+        /* A contagem de pixels so' e' valida no build com ZX_TRACE_CAIXA, porque e'
+     * o driver de video que rastreia o retangulo escrito. Fora desse build o
+     * contador fica em zero e a linha seria mentira ("1000 de 1000 quadros
+     * com menos de 10 mil pixels" quando nao mediu nada). */
+#ifdef ZX_TRACE_CAIXA
+        fprintf(stderr, "[tempo] pixels medios %llu   quadros com <10k pixels: %u de %u\n",
+                zx_tempo_soma_pixels / zx_tempo_contador,
+                zx_tempo_quadros_com_poucos_pixels, zx_tempo_contador);
+#endif
+
+#ifdef ZX_TRACE_CUSTO
+        {
+            /* CUSTO MEDIDO, nao inferido por correlacao.
+             *
+             * Este e' o relatorio que responde "o gargalo e' CPU ou video":
+             * sao tres tempos SOMADOS de verdade, nao tres variaveis que
+             * correlacionam com o tempo.
+             *
+             *   total   = tempo do quadro inteiro (medido no glue)
+             *   refresh = tempo DENTRO de scrlibretro_refresca_pantalla
+             *   pixels  = tempo DENTRO do putpixel (subset do refresh)
+             *   passos  = o que sobra: composicao de camadas, copper, DMA,
+             *             e o laco de CPU propriamente dito
+             *
+             * Para fechar o experimento, rode o MESMO .nex com
+             * ZX_PUTPIXEL_OFF=1: o total cai, e a queda e' o custo do
+             * desenho pixel a pixel. */
+            unsigned long long px2 = zx_custo_chamadas / (zx_tempo_contador ? zx_tempo_contador : 1);
+            unsigned long long rf2 = zx_custo_fim_us / (zx_tempo_contador ? zx_tempo_contador : 1);
+            unsigned long long tt2 = (unsigned long long)zx_tempo_total_us / zx_tempo_contador;
+            fprintf(stderr, "[custo] total medio    %6llu us/quadro\n", tt2);
+            fprintf(stderr, "[custo] refresh medio  %6llu us/quadro  (%llu%% do total, %llu px/quadro)\n",
+                    rf2, tt2 ? (zx_custo_fim_us * 100) / (unsigned long long)zx_tempo_total_us : 0, px2);
+            fprintf(stderr, "[custo] o resto (CPU + copper + DMA + camadas) %6llu us/quadro\n",
+                    tt2 > rf2 ? tt2 - rf2 : 0);
+            fprintf(stderr, "[custo] page faults por quadro: media %.1f  (e' a parcela que bloqueia a thread)\n",
+                    (double)zx_custo_falhas_pg / (zx_tempo_contador ? zx_tempo_contador : 1));
+            fprintf(stderr, "[custo] o custo do putpixel em si vem do A/B com ZX_PUTPIXEL_OFF\n");
+        }
+#endif
+#if defined(ZX_TRACE_CUSTO) || defined(ZX_CONTAR_TIMER)
+        /* Resumo do gerador de interrupcao -- UMA vez, aqui.
+         *
+         * gettimeofday por quadro e' o risco que a correcao do timer.c
+         * eliminou: sob ZESARUX_LIBRETRO, get_timer_check_interrupt() so
+         * consulta o flag que o glue liga, nunca o relogio de parede.
+         * Se "quadros com gettimeofday" for diferente de zero, a correcao
+         * regrediu -- e o numero a comparar e' 69.823 por quadro, que foi o
+         * que medi antes dela. */
+        fprintf(stderr, "[timer] gerador de interrupcao: consultas %llu  max em 1 quadro %llu\n",
+                zx_ct_total, zx_ct_max);
+        fprintf(stderr, "[timer] gettimeofday: total %llu  max em 1 quadro %llu  QUADROS COM GETTIMEOFDAY %llu\n",
+                zx_cg_total, zx_cg_max, zx_cg_quadros_com_gtod);
+        fprintf(stderr, "[timer] esperado depois da correcao: quadros com gettimeofday = 0\n");
+        zx_ct_total = zx_ct_max = zx_cg_total = zx_cg_max = zx_cg_quadros_com_gtod = 0;
+#endif
+
+        zx_tempo_total_us = 0;
+        zx_tempo_soma_pixels = 0;
+        zx_tempo_quadros_com_poucos_pixels = 0;
+        zx_tempo_contador = 0;
+        zx_tempo_pior_us = 0;
+        zx_turbo_max = 0;
+    }
+}
+#endif
+
+/* Pasta da fonte do ZEsarUX nesta maquina de desenvolvimento, onde ficam
+ * tbblue_loader.rom e tbblue.mmc. So existe NESTA maquina -- nunca deve ir
+ * para o build de producao. Mantida aqui, atras de ZX_DEV_FALLBACK, apenas
+ * para nao quebrar o fluxo de teste local enquanto o system_dir/zesarux/ do
+ * RetroArch nao estiver populado.
+ *
+ * NAO e' por causa de um bug do RetroArch: ":\bios" que o RetroArch as vezes
+ * grava no lugar do system_dir e' convencao dele, nao defeito -- ":\ " e' o
+ * prefixo da pasta do proprio programa, entao ":\bios" resolve para
+ * <pasta do RetroArch>\bios, e o valor chega ao core ja resolvido. */
+#ifdef ZX_DEV_FALLBACK
+#define ZX_DATA_DIR "G:/Internet_Temp/Batocera_add/Projetos/NEXT/zesarux-src"
+#endif
+
+static bool zx_find_data_dir(const char *system_dir)
+{
+    /* Ordem de tentativa, para produção:
+     *   1. system_dir/zesarux/  -- onde o usuario deve colocar
+     *      tbblue_loader.rom e o proprio tbblue.mmc (1,05 GB, nao
+     *      distribuido por nos).
+     *   2. ZX_DATA_DIR -- so existe em build de desenvolvimento
+     *      (ZX_DEV_FALLBACK definido); nunca presente numa DLL instalada.
+     */
+    char system_zx[PATH_MAX];
+    const char *candidatos[2];
+    int n = 0;
+
+    if (system_dir && system_dir[0])
+    {
+        snprintf(system_zx, sizeof(system_zx), "%s/zesarux", system_dir);
+        candidatos[n++] = system_zx;
+    }
+
+#ifdef ZX_DEV_FALLBACK
+    candidatos[n++] = ZX_DATA_DIR;
+#endif
+
+    for (int i = 0; i < n; i++)
+    {
+        char abs_dir[PATH_MAX];
+        char teste[PATH_MAX];
+        FILE *f;
+
+        /* BUG DO CWD: find_sharedfile() (utils.c:1254) tenta, em ordem,
+         * (1) caminho relativo ao cwd do processo, (2) ../Resources/,
+         * (3) INSTALL_PREFIX/share/zesarux/, (4) zesarux_path_location.
+         * zesarux_path_location e' a 4a tentativa -- mas se o valor que
+         * guardamos nela nao for um caminho ABSOLUTO, resolve-lo tambem
+         * depende do cwd, e no RetroArch de verdade o cwd e' a pasta do
+         * frontend, nao a pasta de dados do Next. Foi por isso que o .nex
+         * so carregava com o cwd apontando para a pasta certa (matriz 2x2
+         * no relatorio): o caminho guardado "funcionava" por coincidencia
+         * de cwd, nao porque estava correto.
+         *
+         * _fullpath() resolve para absoluto AQUI, antes de qualquer fopen
+         * ou de preencher zesarux_path_location, entao a opcao 4 do
+         * find_sharedfile passa a resolver certo nao importa o cwd. */
+        if (!_fullpath(abs_dir, candidatos[i], sizeof(abs_dir)))
+            continue;
+
+        /* O Next precisa de dois: o loader do ROM e a imagem do SD. */
+        sprintf(teste, "%s/tbblue_loader.rom", abs_dir);
+        f = fopen(teste, "rb");
+        if (!f)
+            continue;
+        fclose(f);
+
+        strncpy(zx_rom_dir, abs_dir, PATH_MAX - 1);
+        zx_rom_dir[PATH_MAX - 1] = 0;
+
+        /* Preenche a variavel que find_sharedfile consulta em utils.c:1278. */
+        strncpy(zesarux_path_location, zx_rom_dir, PATH_MAX - 1);
+        zesarux_path_location[PATH_MAX - 1] = 0;
+
+        sprintf(teste, "%s/tbblue.mmc", zx_rom_dir);
+        f = fopen(teste, "rb");
+        if (f)
+        {
+            fclose(f);
+            zx_sd_found = true;
+            debug_printf(VERBOSE_INFO,
+                         "[libretro] Next: %s (loader + SD)\n", zesarux_path_location);
+        }
+        else
+        {
+            zx_sd_found = false;
+            debug_printf(VERBOSE_ERR,
+                         "[libretro] Next: %s -- tbblue.mmc NAO encontrado. "
+                         "O NextZXOS nao vai subir sem ele. Coloque o seu "
+                         "tbblue.mmc em %s/tbblue.mmc (o arquivo tem ~1 GB e "
+                         "nao e distribuido com o core).\n",
+                         zesarux_path_location, zesarux_path_location);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/* Liga o cartao SD do Next (tbblue.mmc).
+ *
+ * O ZEsarUX normal faz isto pelo menu, em menu_items_storage.c:
+ *   - 12147: strcpy(mmc_file_name[0], ...)   <- qual arquivo e o cartao
+ *   - 11887: mmc_enable(0)                   <- liga o cartao
+ *   - 11889: divmmc_diviface_disable()       <- desliga o paging do DivMMC
+ *   - 11891: divmmc_mmc_ports_enable()       <- liga as portas do DivMMC
+ *   - 11893: hard_reset_cpu()
+ * O RetroArch nao tem esse menu. Sem estes passos o loader do Next mostra
+ * "Error initializing SD card!" mesmo com o tbblue.mmc no lugar certo. */
+static void zx_attach_sd(void)
+{
+    if (!zx_sd_found)
+        return;
+
+    snprintf(mmc_file_name[0], sizeof(mmc_file_name[0]),
+             "%s/tbblue.mmc", zx_rom_dir);
+
+    if (mmc_enabled[0].v == 0)
+        mmc_enable(0);
+    if (divmmc_diviface_enabled.v)
+        divmmc_diviface_disable();
+    if (divmmc_mmc_ports_enabled.v == 0)
+        divmmc_mmc_ports_enable();
+
+    hard_reset_cpu();
+}
+
+bool zx_init(const char *system_dir, const char *save_dir)
+{
+    (void)save_dir;
+
+    if (zx_started)
+        return true;
+
+    zx_fps_override = 0.0;
+
+    /* Antes de qualquer reset: find_sharedfile depende disso para achar o
+     * tbblue_loader.rom, e set_machine() carrega o ROM. */
+    if (!zx_find_data_dir(system_dir))
+        debug_printf(VERBOSE_ERR,
+                     "[libretro] nao achei tbblue_loader.rom; o Next vai subir sem NextZXOS\n");
+
+    /* -------------------------------------------------------
+     * A ordem importa, e o proprio ZEsarUX documenta por que.
+     *
+     * start.c:8840-8862, que e a inicializacao oficial:
+     *
+     *     set_machine(NULL);          <-- escolhe a maquina e prepara a memoria
+     *     cold_start_cpu_registers();
+     *     reset_cpu();                <-- reseta a CPU
+     *     set_menu_gui_zoom();
+     *     init_timer();
+     *     main_init_video();          <-- so DEPOIS registra o driver de video
+     *
+     * E o start.c:8850 explica o motivo, que eu mantive na letra porque e
+     * uma armadilha real:
+     *
+     *     "al cambiar a veces gui zoom a 2 (caso tbblue ou cpc por exemplo),
+     *      o tamanho de zx desktop se multiplica por o gui zoom e entao a
+     *      memoria a asignar do driver de video e maior"
+     *
+     * Ou seja: reset_cpu pode mudar o gui zoom, e o driver de video tem que
+     * alocar DEPOIS disso. Se chamassemos scr_libretro_init antes de
+     * reset_cpu, alocariamos o framebuffer com o tamanho errado.
+     *
+     * No nosso caso o framebuffer e fixo em 1280x960, o maior possivel do
+     * Next, entao o erro nao produziria corte -- mas a ordem continua a
+     * mesma para nao depender dessa folga.
+     * ------------------------------------------------------- */
+
+    /* 1. A maquina: "TBBlue" e o nome exato em machines_short_names_id
+     *    (utils.c:13389), nao "next" nem "tbblue" em minusculas. */
+    zx_choose_machine();
+
+    /* -------------------------------------------------------
+     * 1.2 Stubs de joystick.
+     *
+     * O main() do ZEsarUX define isto em start.c:8549-8550, bem antes de
+     * qualquer outra coisa:
+     *
+     *     realjoystick_init = realjoystick_null_init;
+     *     realjoystick_main = realjoystick_null_main;
+     *
+     * E sao ponteiros de funcao. Sem eles, o core_spectrum.c chama
+     * realjoystick_main() uma vez por quadro e o processador pula para o
+     * endereco 0x0. Foi esse o SIGSEGV, e o gdb mostrou pelo nome do simbolo:
+     *
+     *     <+222>: call *(%rax)          <- crash
+     *     <refptr.realjoystick_main>
+     *
+     * Nos tambem nao precisamos de joystick do ZEsarUX: o joypad vem do
+     * RetroArch e chega em zx_set_joy. Mas o emulador CHAMA o ponteiro, entao
+     * ele precisa existir.
+     * ------------------------------------------------------- */
+    realjoystick_init = realjoystick_null_init;
+    realjoystick_main = realjoystick_null_main;
+
+    /* -------------------------------------------------------
+     * 1.5 Tabelas globais, ANTES de qualquer reset.
+     *
+     * Sao 11 chamadas do main() (start.c:8770-8789) que eu nao tinha ligado.
+     * Uma delas e' a causa do SIGSEGV em fetch_opcode_spectrum:
+     *
+     *   operaciones.c:148   z80_byte *visualmem_opcode_buffer=NULL;
+     *   operaciones.c:183   visualmem_opcode_buffer = util_malloc_fill(...)
+     *   operaciones.c:228   set_visualmemopcodebuffer(dir) { ... visualmem_opcode_buffer[dir] ... }
+     *
+     * fetch_opcode_spectrum chama set_visualmemopcodebuffer como PRIMEIRA
+     * instrucao (operaciones.c:1145). Sem init_visualmembuffer, o ponteiro
+     * continua NULL e o acesso morre. E o mesmo para os outros: as tabelas
+     * de opcode, de contencao, de tempo e de cor sao todas globais e
+     * precisam existir antes da CPU rodar.
+     *
+     * A ordem e a do main(), e ela importa: init_cpu_tables monta o nucleo
+     * da CPU; set_machine sobe depois.
+     * ------------------------------------------------------- */
+    init_cpu_tables();                       /* start.c:8770 */
+    init_ulaplus_table();                    /* start.c:8776 */
+    init_prism_palettes();                   /* start.c:8777 */
+    screen_init_colour_table();              /* start.c:8779  <-- a paleta */
+    screen_init_ext_desktop();               /* start.c:8781 */
+    init_visual_real_tape();                 /* start.c:8782 */
+    init_screen_addr_table();                /* start.c:8783 */
+    init_cpc_line_display_table();           /* start.c:8785 */
+    init_visualmembuffer();                  /* start.c:8788  <-- o crash */
+    inicializa_tabla_contend_speed_higher(); /* start.c:8793 */
+
+    /* 2. Memoria e registradores da maquina. */
+    set_machine(NULL);
+    cold_start_cpu_registers();
+    reset_cpu();
+    set_menu_gui_zoom();
+
+    /* 3. Agora sim o video: o driver le o tamanho que reset_cpu definiu. */
+    if (scr_libretro_init())
+    {
+        debug_printf(VERBOSE_ERR, "[libretro] falha ao alocar o framebuffer\n");
+        return false;
+    }
+
+    /* Audio: o ZEsarUX le frecuencia_sonido_variable dentro do init, e por
+     * isso ele precisa vir antes de snd_libretro_init(). Ver
+     * audio.c:702 e cpu.c:1379. */
+    if (snd_libretro_init())
+    {
+        debug_printf(VERBOSE_ERR, "[libretro] falha ao alocar o buffer de audio\n");
+        scr_libretro_end();
+        return false;
+    }
+
+    /* main_init_audio(): aloca e liga os dois buffers de audio.
+     *
+     * Sem isto, audio_buffer fica NULL (audio.c:850) e o primeiro sample do
+     * primeiro scanline mata o processo em audio.c:2550:
+     *
+     *     audio_send_stereo_sample()
+     *         audio_buffer[audio_buffer_indice] = ...;    <- NULL[0]
+     *
+     * main_init_audio() (start.c:2720) faz quatro coisas que importam, e nao
+     * so registrar o driver:
+     *
+     *     audio_playing.v = 1;                          liga o som
+     *     audio_buffer_one = audio_buffer_one_assigned;  buffer 1
+     *     audio_buffer_two = audio_buffer_two_assigned;  buffer 2
+     *     set_active_audio_buffer();                     escolhe o atual
+     *     audio_empty_buffer();                          zera
+     *
+     * Chamo a sequencia equivalente a mao em vez de main_init_audio(), porque
+     * aquela funcao tambem registra o driver pelo mecanismo de fallback com
+     * audio_init(), e nos ja registramos os seis ponteiros diretamente (e
+     * holding audio_init() para o nosso snd_libretro_init).
+     */
+    audio_playing.v        = 1;
+    audio_buffer_one       = audio_buffer_one_assigned;
+    audio_buffer_two       = audio_buffer_two_assigned;
+    set_active_audio_buffer();
+    audio_empty_buffer();
+
+    /* init_timer() NAO e' chamado aqui, de proposito.
+     *
+     * Sem start_timer(), o timer_selected fica TIMER_UNASSIGNED (timer.c:116)
+     * e get_timer_check_interrupt() cai no ramo "thread" (timer.c:1030), que
+     * so devolve a interrupcao de 50 Hz quando timer_pthread_generada == 1
+     * (timer.c:911). Quem liga essa variavel, no ZEsarUX normal, e' a thread
+     * do timer.
+     *
+     * Num core libretro nao ha thread de timer: quem faz o papel do relogio
+     * e' o frontend, uma vez por retro_run. Ver zx_run_frame(), que chama
+     * timer_trigger_interrupt() antes do laco -- e' o que fa o emulador
+     * sair da espera do fim de quadro.
+     */
+
+    /* Liga os drivers no emulador. main_init_video/main_init_audio fazem
+     * exatamente isto no ZEsarUX normal (start.c:2613 e start.c:2720), so
+     * que la cada driver esta sob um #ifdef do compileoptions.h. Aqui
+     * chamamos os nossos direto, porque sao os unicos compilados.
+     *
+     * main_init_video tambem faz scr_set_parameters_slow_machines() e
+     * set_putpixel_zoom() depois de instalar o driver; sem eles o desenho
+     * pode sair com parametros de maquina lenta desatualizados. */
+    /* O conjunto INTEIRO de ponteiros de audio. Sao seis, e o ZEsarUX os
+     * chama sem checar -- por isso deixar qualquer um em NULL e um salto para
+     * o endereco 0x0. Ja caimos nessa tres vezes (realjoystick_main,
+     * scr_actualiza_tablas_teclado, audio_can_record_input).
+     *
+     * A referencia e' set_audiodriver_null() (audio.c:1997-2004), que e' o
+     * conjunto minimo que o proprio autor considera seguro:
+     *
+     *     audio_init, audio_send_frame, audio_thread_finish,
+     *     audio_end, audio_get_buffer_info, audio_can_record_input
+     */
+    audio_init              = snd_libretro_init;
+    audio_end               = snd_libretro_end;
+    audio_send_frame        = snd_libretro_send_frame;
+    audio_thread_finish     = snd_libretro_thread_finish;
+    audio_get_buffer_info   = snd_libretro_get_buffer_info;
+    audio_can_record_input  = snd_libretro_can_record_input;
+    scr_init_pantalla = scr_libretro_init;
+
+    set_putpixel_zoom();
+    screen_set_parameters_slow_machines();
+
+    /* -------------------------------------------------------
+     * O resto da inicializacao do main(), que faltava.
+     *
+     * Sem init_chip_ay e init_chip_sn nao ha som nenhum: sao os dois chips de
+     * audio do Spectrum (o AY-3-8912 e o SN76489). Sem eles o emulador roda
+     * mudo -- e, pior, os ponteiros de audio ficam apontando para nada.
+     *
+     * Sem as flags de interrupcao zeradas, o quadro nunca fecha:
+     * interrupcion_timer_generada e o que o core_spectrum.c:420 le para
+     * saber se ja pode zerar esperando_tiempo_final_t_estados. Se ela ja
+     * estiver em 1 ao entrar, o do/while do zx_run_frame sai sem emular.
+     *
+     * A ordem e a do proprio main() (start.c:8894-8984).
+     * ------------------------------------------------------- */
+    init_chip_ay();
+    init_chip_sn();
+    ay_init_filters();
+    sn_init_filters();
+    mid_reset_export_buffers();
+
+    /* Liga o SD do Next. Fica aqui, depois de maquina, video e audio estarem
+     * prontos (o hard_reset_cpu precisa deles) e ANTES do bloco abaixo, que
+     * zera as flags de interrupcao e fixa o estado inicial do quadro. */
+    zx_attach_sd();
+
+    /* start.c:8975-8984 */
+    reg_pc = 0;
+    interrupcion_maskable_generada.v    = 0;
+    interrupcion_non_maskable_generada.v = 0;
+    interrupcion_timer_generada.v        = 0;
+    z80_halt_signal.v                     = 0;
+    z80_wait_signal.v                     = 0;
+
+    /* esperando_tiempo_final_t_estados comeca em 1, NAO em 0.
+     *
+     * O comentario em core_spectrum.c:423 e' explicito:
+     *     "Llegado a final de frame pero aun no ha llegado interrupcion de
+     *      timer. Esperemos..."
+     *     esperando_tiempo_final_t_estados.v = 1;
+     *
+     * Ou seja, 1 = o quadro esta em curso, aguardando o timer; 0 = acabou.
+     * E o core_spectrum.c:1088 usa isso como condicao de fetch:
+     *     if (esperando_tiempo_final_t_estados.v==0) { core_spectrum_ciclo_fetch(); }
+     *
+     * Zerar a flag aqui -- como eu fazia -- impedia o fetch de opcode, a CPU
+     * nao executava nada, e o emulador caia num caminho alternativo que
+     * chamava um ponteiro de funcao nunca registrado. Da o SIGSEGV em endereco
+     * 0x0, no meio de alguns quadros. */
+    esperando_tiempo_final_t_estados.v    = 1;
+
+    framescreen_saltar                    = 0;
+
+#ifdef ZX_TRACE
+    fprintf(stderr, "[zx] init: maquina %d, ROM=%s\n",
+            current_machine_type,
+            MACHINE_IS_TBBLUE ? "tbblue_loader.rom" : "outro");
+    fprintf(stderr, "[zx] init: zesarux_path_location=[%s]\n", zesarux_path_location);
+
+    /* O ROM do Next NAO esta em memoria_spectrum[0]. Ele vai para
+     * tbblue_fpga_rom, que aponta para o offset 2 MB da mesma memoria
+     * (tbblue.c:2968) e e' o que a CPU le em 0x0000 pela tabela de paginas
+     * (tbblue.c:3644). Ler memoria_spectrum[0] da a RAM, que e' zeros por
+     * definicao -- foi o que me enganou antes.
+     *
+     * O loader do Next comeca com F3 ED 56 (DI). Se vierem zeros aqui, o
+     * find_sharedfile falhou de verdade. */
+    fprintf(stderr, "[zx] init: memoria=%p  tbblue_fpga_rom=%p\n",
+            (void *)(size_t)memoria_spectrum, (void *)(size_t)tbblue_fpga_rom);
+    if (tbblue_fpga_rom)
+    {
+        int k;
+        fprintf(stderr, "[zx] init: FPGA_ROM[0..15] =");
+        for (k = 0; k < 16; k++)
+            fprintf(stderr, " %02X", tbblue_fpga_rom[k]);
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "[zx] init: reg_pc=%04X\n", reg_pc);
+#endif
+
+    zx_started = true;
+    zx_paused  = true;    /* comeca pausado: o core decide quando comeca */
+    zx_wants_pause = true;
+
+    return true;
+}
+
+void zx_deinit(void)
+{
+    if (!zx_started)
+        return;
+
+    audio_end();
+    scr_libretro_end();
+
+    zx_started = false;
+    zx_paused  = true;
+}
+
+/* ---------------------------------------------------------------- conteudo --- */
+
+bool zx_load_content(const char *path)
+{
+    /* Sem caminho: boot do NextZXOS / BASIC, como o ZEsarUX faz com --noargs. */
+    if (path && path[0])
+    {
+        /* ---------------------------------------------------------------
+         * COMO O ZESARUX CARREGA UM .nex
+         *
+         * Contrary ao que se imagina, .nex nao e' "carga de jogo": o
+         * ZEsarUX trata .nex como SNAPSHOT. O caminho e' este:
+         *
+         *   utils.c:6128   || !util_compare_file_extension(nombre,"nex")
+         *   utils.c:6138       insert_snap_cmdline(nombre);   guarda o nome
+         *   utils.c:6139       snapshot_load();               dispara
+         *   snap.c:5373            load_nex_snapshot(nombre);  <-- aqui
+         *
+         * E por isso que os 2.480 .nex que voce extraiu sao snapshots com
+         * RAM e estado de CPU, e nao apenas codigo: e isso que faz o jogo
+         * aparecer ja em execucao, sem boot.
+         *
+         * Chamamos quickload() e nao as duas funcoes soltas, porque e ele
+         * que salva e restaura o estado dos interfaces antes e depois
+         * (utils.c:6747-6778): divmmc, divide, superupgrade, breakpoints.
+         * Sem isso, o carregamento pode deixar a maquina num estado em que
+         * a proxima execucao gera segfault -- o proprio autor comenta isso
+         * em utils.c:6771 sobre os breakpoints.
+         * --------------------------------------------------------------- */
+        debug_printf(VERBOSE_INFO, "[libretro] quickload: %s\n", path);
+
+#ifdef ZX_TRACE_CARGA
+        /* Antes do quickload: o arquivo existe e pode ser lido? Sem isso,
+         * qualquer falha depois e' indistinguivel. */
+        {
+            FILE *t = fopen(path, "rb");
+            fprintf(stderr, "[carga] fopen antes do quickload: %s\n", t ? "OK" : "FALHOU");
+            if (t) fclose(t);
+        }
+#endif
+
+        /* quickload chama set_machine() por dentro quando o arquivo exige
+         * outra maquina, entao pode trocar current_machine_type. */
+        quickload((char *)path);
+
+#ifdef ZX_TRACE_CARGA
+        /* O debug_printf do ZEsarUX so escreve se o nivel de verbose dele
+         * estiver ligado, e eu nunca ligo -- entao o log nao serve para dizer
+         * se a carga funcionou. E' preciso olhar o ESTADO da maquina.
+         *
+         * O Spectron2084.nex comeca com PC=0x6000 e SP=0x6000. Se a carga
+         * falhou, PC fica 0000 e SP fica FFFF (o reset). E o banco 5 esta no
+         * arquivo, entao em 0x6000 deve haver codigo, nao zeros. */
+        {
+            int k;
+            fprintf(stderr, "[carga] arquivo: %s\n", path);
+            fprintf(stderr, "[carga] reg_pc=%04X  reg_sp=%04X   (esperado 6000/6000)\n",
+                    reg_pc, reg_sp);
+            fprintf(stderr, "[carga] RAM em 0x6000:");
+            for (k = 0; k < 24; k++)
+                fprintf(stderr, " %02X", memoria_spectrum[0x6000 + k]);
+            fprintf(stderr, "\n[carga] maquina=%d  turbo=%d  velocidade=%d%%\n",
+                    current_machine_type, cpu_turbo_speed, porcentaje_velocidad_emulador);
+        }
+#endif
+    }
+
+    /* Conteudo carregado: a maquina arranca rodando. */
+    zx_paused      = false;
+    zx_wants_pause = false;
+
+    return true;
+}
+
+void zx_unload_content(void)
+{
+    zx_paused      = true;
+    zx_wants_pause = true;
+}
+
+void zx_reset(bool hard)
+{
+    /* reset_cpu (cpu.c:993) e hard_reset_cpu (cpu.c:958). O hard tambem
+     * reinicia a RAM; o soft so os registradores. */
+    if (hard)
+        hard_reset_cpu();
+    else
+        reset_cpu();
+}
+
+/* ------------------------------------------------------------------ pausa --- */
+
+void zx_set_paused(bool paused)
+{
+    /* Nao mudamos o estado agora: o RetroArch chama retro_run numa thread
+     * diferente da que carrega o conteudo, e mexer na maquina de dentro do
+     * callback poderia acontecer no meio de um passo de CPU. O pedido fica
+     * pendente e e aplicado no inicio do proximo zx_run_frame, que roda
+     * sempre na thread do frontend. */
+    zx_wants_pause = paused;
+}
+
+bool zx_is_paused(void)
+{
+    return zx_paused;
+}
+
+/* ------------------------------------------------------------------- laco --- */
+
+void zx_run_frame(void)
+{
+    unsigned guarda = 0;
+
+#ifdef ZX_TRACE
+    fprintf(stderr, "[zx] run_frame entrou\n");
+#endif
+
+#ifdef ZX_TRACE_CAIXA
+    /* Mede o retangulo realmente escrito no buffer.
+     *
+     * A tela estar fora do centro pode ser porque o emulador escreve a
+     * partir de (offset_x, offset_y) -- o Next posiciona as camadas por
+     * coordenada de hardware -- e o frontend so mostra a partir de (0,0).
+     * Sem medir, qualquer correcao (centralizar, deslocar o ponteiro) e
+     * chute.
+     *
+     * A medicao fica DEPOIS do laco, e nao em volta de um cpu_core_loop: o
+     * desenho acontece no fim do quadro, e um passo isolado nao desenha
+     * nada. Foi o que a primeira versao fez, e por isso reportou "nenhum
+     * pixel escrito" mesmo com o core funcioando. */
+    zx_caixa_reset();
+#endif
+
+#ifdef ZX_TRACE_TEMPO
+    /* Tres tempos por quadro, para separar o custo da CPU do custo do video.
+     *
+     * E preciso guardar o PIOR caso, nao so a media: o ZEsarUX nem sempre
+     * redesenha o quadro inteiro -- a contagem de pixels ja variou tres
+     * ordens de grandeza entre quadros -- entao a media esconde o gargalo,
+     * que esta justamente nos quadros de redesenho completo. */
+    zx_tempo_t0 = zx_agora_us();
+    zx_tempo_n  = 0;
+#endif
+
+#ifdef ZX_TRACE_CUSTO
+    /* O acumulado do refresh e' global e nunca zera. Guardar o valor aqui, no
+     * INICIO do quadro, e o que permite medir quanto do quadro foi desenho. */
+    {
+        zx_custo_ref0 = zx_custo_fim_us;
+        zx_custo_pg0  = zx_falhas_pg_agora();
+    }
+#endif
+#if defined(ZX_TRACE_CUSTO) || defined(ZX_CONTAR_TIMER)
+    /* Base dos contadores do timer: tem de ser lida NO INICIO do quadro. Ler
+     * depois do quadro daria delta zero. */
+    zx_contador_timer_base[0] = zx_contador_timer_thread;
+    zx_contador_timer_base[1] = zx_contador_timer_nothread;
+#endif
+
+    if (!zx_started)
+        return;
+
+    /* Aplica o pedido de pausa pendente. */
+    if (zx_wants_pause != zx_paused)
+        zx_paused = zx_wants_pause;
+
+    if (zx_paused)
+        return;
+
+    /* "Passaram 20 ms": o frontend E' o relogio.
+     *
+     * Aqui so falta LIGAR a interrupcao de 50 Hz deste quadro. Quem decide
+     * QUE timer usar esta agora no timer.c, sob ZESARUX_LIBRETRO:
+     *
+     *   get_timer_check_interrupt()  devolve sempre o ramo por flag
+     *   start_timer()               nao inicializa thread nenhuma
+     *   stop_current_timer()        nao para thread nenhuma
+     *   timer_restart()             nao faz nada
+     *
+     * Antes disso, este bloco trocava timer_selected para TIMER_USLEEP e
+     * restaurava no fim. Funcionava, mas era FRAGIL: set_machine_params() ->
+     * set_emulator_speed() -> timer_restart() (cpu.c:1374) roda no MEIO do
+     * quadro quando o jogo muda o turbo, e com timer_selected==TIMER_USLEEP o
+     * stop_current_timer() original tentaria parar com pthread_cancel uma
+     * thread que nunca foi criada. A correcao no timer.c elimina esse risco
+     * de raiz, porque nenhum caminho chega mais a um timer real.
+     *
+     * A troca e' removida de proposito: manter timer_selected em TIMER_USLEEP
+     * faria timer_delete() e o menu do ZXVision acreditarem que existe um
+     * timer ativo, e nao existe. */
+    {
+        /* Um disparo por quadro. timer_check_interrupt_thread() consome este
+         * flag e devolve 1 uma unica vez, o que gera exatamente uma
+         * interrupcao de 50 Hz em cada quadro. */
+        timer_trigger_interrupt();
+
+    /* Executa passos ate o fim do quadro.
+     *
+     * A flag funciona ao contrario do que o nome sugere:
+     *   1 = o quadro esta em curso, aguardando a interrupcao de timer
+     *   0 = o quadro acabou (core_spectrum.c:420-430)
+     *
+     * E a CPU so busca opcode com a flag em 0 (core_spectrum.c:1088), que e'
+     * a fase de execucao DENTRO do quadro. Entao espera-se enquanto for 0 e
+     * sai quando virar 1. O guarda evita que uma avaria trave o frontend
+     * inteiro, que e' impossivel de matar. */
+    do {
+#ifdef ZX_TRACE
+        if (guarda < 3)
+            fprintf(stderr, "[zx]   cpu_core_loop #%u  flag=%d\n",
+                    guarda, esperando_tiempo_final_t_estados.v);
+#endif
+cpu_core_loop();
+    } while (++guarda < 2000000 && esperando_tiempo_final_t_estados.v == 0);
+    }
+
+#ifdef ZX_TRACE_CAIXA
+    zx_caixa_dump();
+#endif
+
+#ifdef ZX_TRACE_TEMPO
+    zx_tempo_registra(guarda, zx_tempo_t0);
+#endif
+
+#ifdef ZX_TRACE
+    /* timer_selected fica TIMER_UNASSIGNED o tempo todo agora: sob
+     * ZESARUX_LIBRETRO, start_timer() e' um no-op. Que isso seja o estado
+     * esperado e' a verificacao de que a correcao do timer.c pegou -- se
+     * aparecer outro nome aqui, o timer_selected voltou a ter peso. */
+    fprintf(stderr, "[zx] quadro: %u passos, flag=%d, timer=%s\n",
+            guarda, esperando_tiempo_final_t_estados.v,
+            /* pelo NOME, nunca pelo numero: enum timer_type em timer.h:28 e'
+               TIMER_USLEEP=0, TIMER_DATE=1, TIMER_SDL=2... e ler "2" como
+               TIMER_DATE seria errado (2 e' TIMER_SDL). */
+            timer_selected == TIMER_DATE     ? "TIMER_DATE" :
+            timer_selected == TIMER_USLEEP   ? "TIMER_USLEEP" :
+            timer_selected == TIMER_SDL      ? "TIMER_SDL" :
+            timer_selected == TIMER_MAC      ? "TIMER_MAC" :
+            timer_selected == TIMER_UNASSIGNED ? "TIMER_UNASSIGNED" : "?");
+#endif
+
+    if (guarda >= 2000000)
+        debug_printf(VERBOSE_ERR, "[libretro] quadro nao fechou em 2 milhoes de passos\n");
+}
+
+/* ------------------------------------------------------------------ video --- */
+
+const uint32_t *zx_get_framebuffer(unsigned *width, unsigned *height, size_t *pitch_bytes)
+{
+    return zx_libretro_framebuffer(width, height, pitch_bytes);
+}
+
+/* ------------------------------------------------------------------ audio --- */
+
+size_t zx_get_audio(int16_t *out, size_t max_frames)
+{
+    if (!zx_started || zx_paused)
+        return 0;
+
+    return snd_libretro_read(out, max_frames);
+}
+
+/* ---------------------------------------------------------------- entrada --- */
+
+/* Os valores de util_teclas para letras e digitos sao os codigos ASCII.
+ *
+ * Confirmado pelo proprio ZEsarUX, utils.h:315:
+ *     "UTIL_KEY_SPACE=128,  //128 en adelante para no entrar en conflicto con
+ *      teclas ascii <128"
+ *
+ * Ou seja: os especiais comecam em 128 DEPOIS das ASCII, entao as letras sao
+ * o proprio valor ASCII. Nao ha tabela de conversao a fazer.
+ *
+ * F1..F12 e ESC NAO sao mapeadas de proposito: no ZEsarUX elas abrem o menu e
+ * as funcoes do ZXVision (util_set_reset_key_continue_f_functions), e num core
+ * libretro nao ha menu -- o RetroArch provides o proprio. */
+static int zx_map_key(unsigned k)
+{
+    if (k >= RETROK_a && k <= RETROK_z) return 'a' + (int)(k - RETROK_a);
+    if (k >= RETROK_0 && k <= RETROK_9) return '0' + (int)(k - RETROK_0);
+
+    switch (k)
+    {
+        case RETROK_SPACE:     return UTIL_KEY_SPACE;
+        case RETROK_RETURN:    return UTIL_KEY_ENTER;
+        case RETROK_KP_ENTER:  return UTIL_KEY_ENTER;
+        case RETROK_BACKSPACE: return UTIL_KEY_BACKSPACE;
+        case RETROK_LSHIFT:    return UTIL_KEY_SHIFT_L;
+        case RETROK_RSHIFT:    return UTIL_KEY_SHIFT_R;
+        case RETROK_LCTRL:     return UTIL_KEY_CONTROL_L;
+        case RETROK_RCTRL:     return UTIL_KEY_CONTROL_R;
+        case RETROK_LALT:      return UTIL_KEY_ALT_L;
+        case RETROK_RALT:      return UTIL_KEY_ALT_R;
+        case RETROK_UP:        return UTIL_KEY_UP;
+        case RETROK_DOWN:      return UTIL_KEY_DOWN;
+        case RETROK_LEFT:      return UTIL_KEY_LEFT;
+        case RETROK_RIGHT:     return UTIL_KEY_RIGHT;
+        case RETROK_COMMA:     return UTIL_KEY_COMMA;
+        case RETROK_PERIOD:    return UTIL_KEY_PERIOD;
+        case RETROK_TAB:       return UTIL_KEY_TAB;
+        default:               return -1;
+    }
+}
+
+void zx_set_key(unsigned retro_keycode, bool down)
+{
+    int k;
+
+    if (!zx_started || zx_paused)
+        return;
+
+    k = zx_map_key(retro_keycode);
+    if (k < 0)
+        return;
+
+    util_set_reset_key((enum util_teclas)k, down ? 1 : 0);
+}
+
+/* So reagimos a MUDANCAS: o RetroArch chama retro_run 50 vezes por segundo e
+ * joystick_set_fire() a cada chamada reescreveria o estado do botao sem
+ * necessidade, alem de gastar CPU. */
+void zx_set_joy(unsigned port, uint16_t m)
+{
+    static uint16_t prev;
+    uint16_t changed;
+
+    if (port != 0 || !zx_started || zx_paused)
+        return;
+
+    changed = (uint16_t)(m ^ prev);
+    if (!changed)
+        return;
+
+#define ZX_JOY_BIT(id) (1u << (id))
+
+    if (changed & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_UP)) {
+        if (m & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_UP)) joystick_set_up(0);
+        else joystick_release_up(0);
+    }
+    if (changed & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_DOWN)) {
+        if (m & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_DOWN)) joystick_set_down(0);
+        else joystick_release_down(0);
+    }
+    if (changed & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_LEFT)) {
+        if (m & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_LEFT)) joystick_set_left(0);
+        else joystick_release_left(0);
+    }
+    if (changed & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_RIGHT)) {
+        if (m & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_RIGHT)) joystick_set_right(0);
+        else joystick_release_right(0);
+    }
+
+    /* Fogo: B = fire 0, A = fire 1 (o Next le o botao 2 como start). */
+    if (changed & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_B)) {
+        if (m & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_B)) joystick_set_fire(0, 0);
+        else joystick_release_fire(0, 0);
+    }
+    if (changed & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_A)) {
+        if (m & ZX_JOY_BIT(RETRO_DEVICE_ID_JOYPAD_A)) joystick_set_fire(0, 1);
+        else joystick_release_fire(0, 1);
+    }
+
+#undef ZX_JOY_BIT
+
+    prev = m;
+}
+
+/* ------------------------------------------------------------ core options --- */
+
+void zx_set_option(const char *key, const char *value)
+{
+    if (!strcmp(key, "zesarux_refresh"))
+        zx_fps_override = (value && value[0] == '6') ? 60.0 : 50.0;
+
+    /* "zesarux_cpu_speed": o ZEsarUX calcula
+     * porcentaje_velocidad_emulador, que depois muda a taxa de audio em
+     * cpu.c:1379. Ainda nao foi ligado. */
+}
+
+/* -------------------------------------------------------------- save state --- */
+
+size_t zx_state_size(void)
+{
+    return 0;
+}
+
+bool zx_state_save(void *data, size_t size)
+{
+    (void)data; (void)size;
+    return false;
+}
+
+bool zx_state_load(const void *data, size_t size)
+{
+    (void)data; (void)size;
+    return false;
+}

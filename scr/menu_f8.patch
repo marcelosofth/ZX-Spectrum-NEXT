@@ -1,0 +1,393 @@
+--- a/zesarux_glue.c	2026-10-02 16:04:53.231640351 +0000
++++ b/zesarux_glue.c	2026-10-02 18:59:04.869994989 +0000
+@@ -52,6 +52,8 @@
+ #include <math.h>   /* sqrt, para a correlacao do [corr] */
+ #include <stdlib.h>
+ #include <string.h>
++#include <pthread.h>
++#include <unistd.h>   /* usleep: o mesmo que o menu do ZEsarUX usa */
+ 
+ #include "cpu.h"
+ #include "start.h"
+@@ -60,6 +62,7 @@
+ #include "debug.h"
+ #include "settings.h"
+ #include "menu_items.h"
++#include "zxvision.h"    /* menu_inicio, menu_abierto, menu_multitarea, menu_set_menu_abierto */
+ #include "chardevice.h"
+ #include "timer.h"      /* init_timer, timer.h:70  */
+ #include "ay38912.h"    /* init_chip_ay, ay_init_filters  */
+@@ -89,6 +92,31 @@
+ static bool  zx_wants_pause;
+ static double zx_fps_override;
+ 
++/* ---- menu do ZEsarUX (tecla F8) ---------------------------------------------
++ *
++ * O menu e' um laco bloqueante (menu_inicio) que le o teclado pelas portas
++ * emuladas (puerto_*). retro_run nao pode bloquear, entao o menu roda numa
++ * thread propria enquanto a thread do frontend continua chamando retro_run:
++ * ela segue fazendo input_poll (e alimentando as portas via zx_set_key), mas
++ * zx_run_frame NAO executa a CPU enquanto o menu esta aberto.
++ *
++ * A pausa do menu NAO usa zx_paused: zx_set_key/zx_set_joy descartam entrada
++ * com zx_paused==true, e o menu precisa dessa entrada. */
++#define ZX_MENU_HOTKEY RETROK_F8
++
++static pthread_t       zx_menu_thr;
++static volatile int    zx_menu_alive;    /* thread criada e ainda nao juntada */
++static volatile int    zx_menu_done;     /* menu_inicio() retornou */
++static volatile int    zx_menu_wanted;   /* hotkey apertada, thread ainda nao criada */
++static volatile int    zx_osd_wanted;    /* botao X: abrir o teclado virtual */
++static volatile int    zx_menu_osd;      /* a thread aberta e' o teclado virtual:
++                                          * a CPU CONTINUA rodando, porque o teclado
++                                          * envia teclas ao Spectrum */
++static pthread_mutex_t zx_fb_mutex = PTHREAD_MUTEX_INITIALIZER;
++static unsigned char   zx_key_held[512]; /* teclas que entregamos ao engine */
++
++static void zx_menu_close_blocking(void);
++
+ /* O ZEsarUX mantem o estado global da maquina em variaveis estaticas
+  * espalhadas. Nao ha estrutura de contexto para instanciar, entao usamos
+  * essas variaveis diretamente.
+@@ -967,6 +995,8 @@
+     if (!zx_started)
+         return;
+ 
++    zx_menu_close_blocking();   /* a thread do menu usa video e audio */
++
+     audio_end();
+     scr_libretro_end();
+ 
+@@ -1074,12 +1104,15 @@
+ 
+ void zx_unload_content(void)
+ {
++    zx_menu_close_blocking();
+     zx_paused      = true;
+     zx_wants_pause = true;
+ }
+ 
+ void zx_reset(bool hard)
+ {
++    zx_menu_close_blocking();   /* nao resetar a CPU por baixo do menu */
++
+     /* reset_cpu (cpu.c:993) e hard_reset_cpu (cpu.c:958). O hard tambem
+      * reinicia a RAM; o soft so os registradores. */
+     if (hard)
+@@ -1088,6 +1121,150 @@
+         reset_cpu();
+ }
+ 
++/* ------------------------------------------------------------------- menu --- */
++
++/* Fronteira do framebuffer: o driver de video (scr_libretro.c) trava isto ao
++ * desenhar e o retro_run trava ao entregar o quadro ao frontend. */
++void zx_fb_lock(void)   { pthread_mutex_lock(&zx_fb_mutex); }
++void zx_fb_unlock(void) { pthread_mutex_unlock(&zx_fb_mutex); }
++
++bool zx_menu_active(void)
++{
++    return zx_menu_alive != 0;
++}
++
++static void zx_key_send(int k, int down)
++{
++    if (k >= 0 && (size_t)k < sizeof(zx_key_held))
++        zx_key_held[k] = (unsigned char)(down ? 1 : 0);
++    util_set_reset_key((enum util_teclas)k, down ? 1 : 0);
++}
++
++/* Evita tecla "presa" quando o menu abre/fecha com algo pressionado. */
++static void zx_release_all_keys(void)
++{
++    size_t k;
++    for (k = 0; k < sizeof(zx_key_held); k++)
++        if (zx_key_held[k])
++        {
++            zx_key_held[k] = 0;
++            util_set_reset_key((enum util_teclas)k, 0);
++        }
++}
++
++static void *zx_menu_thread_main(void *arg)
++{
++    (void)arg;
++    menu_inicio();              /* bloqueia ate o usuario sair do menu */
++    menu_set_menu_abierto(0);
++    zx_menu_done = 1;           /* a thread do frontend faz o join */
++    return NULL;
++}
++
++static bool zx_menu_start(int osd)
++{
++    pthread_attr_t attr;
++    int rc;
++
++    if (zx_menu_alive)
++        return true;
++
++    zx_release_all_keys();
++    zx_menu_done = 0;
++    zx_menu_osd  = osd;
++
++    /* Com multitarea ligada o menu chama cpu_core_loop() por conta propria,
++     * e a CPU rodaria numa segunda thread ao mesmo tempo que zx_run_frame. */
++    menu_multitarea = 0;
++
++    /* Pedido nativo do engine: menu_si_pulsada_tecla_osd() (zxvision.c) le esta
++     * flag e abre o teclado direto, sem mostrar o menu principal. */
++    if (osd)
++        menu_button_osdkeyboard.v = 1;
++
++    menu_set_menu_abierto(1);
++
++    /* O menu usa buffers grandes na pilha (seletor de arquivos); nao confiar
++     * no tamanho padrao de thread (1 MB no Windows). */
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, 8u * 1024u * 1024u);
++    rc = pthread_create(&zx_menu_thr, &attr, zx_menu_thread_main, NULL);
++    pthread_attr_destroy(&attr);
++
++    if (rc != 0)
++    {
++        debug_printf(VERBOSE_ERR, "[libretro] nao consegui criar a thread do menu\n");
++        menu_set_menu_abierto(0);
++        menu_button_osdkeyboard.v = 0;
++        zx_menu_osd = 0;
++        return false;
++    }
++
++    zx_menu_alive = 1;
++    return true;
++}
++
++/* Chamada pela thread do frontend: se o menu terminou, junta a thread. */
++static void zx_menu_reap(void)
++{
++    if (!zx_menu_alive || !zx_menu_done)
++        return;
++
++    pthread_join(zx_menu_thr, NULL);
++    zx_menu_alive = 0;
++    zx_menu_done  = 0;
++    zx_menu_osd   = 0;
++    menu_button_osdkeyboard.v = 0;
++    zx_release_all_keys();
++}
++
++/* Fecha o menu "como o usuario faria": ESC ate a thread terminar. Usado em
++ * unload/deinit/reset, onde nao da para deixar a thread viva. */
++static void zx_menu_close_blocking(void)
++{
++    int i;
++
++    zx_menu_wanted = 0;
++    zx_osd_wanted  = 0;
++    if (!zx_menu_alive)
++        return;
++
++    for (i = 0; i < 100 && !zx_menu_done; i++)
++    {
++        zx_key_send(UTIL_KEY_ESC, 1);
++        usleep(30000);
++        zx_key_send(UTIL_KEY_ESC, 0);
++        usleep(30000);
++    }
++
++    if (zx_menu_done)
++        zx_menu_reap();
++    else
++        debug_printf(VERBOSE_ERR, "[libretro] o menu nao fechou; thread deixada viva\n");
++}
++
++/* Joypad -> teclas, so enquanto o menu esta aberto (A=Enter, B=Esc). */
++static void zx_menu_joy(uint16_t m)
++{
++    static uint16_t prev;
++    static const struct { unsigned id; int key; } map[] = {
++        { RETRO_DEVICE_ID_JOYPAD_UP,    UTIL_KEY_UP    },
++        { RETRO_DEVICE_ID_JOYPAD_DOWN,  UTIL_KEY_DOWN  },
++        { RETRO_DEVICE_ID_JOYPAD_LEFT,  UTIL_KEY_LEFT  },
++        { RETRO_DEVICE_ID_JOYPAD_RIGHT, UTIL_KEY_RIGHT },
++        { RETRO_DEVICE_ID_JOYPAD_A,     UTIL_KEY_ENTER },
++        { RETRO_DEVICE_ID_JOYPAD_B,     UTIL_KEY_ESC   },
++    };
++    uint16_t changed = (uint16_t)(m ^ prev);
++    size_t i;
++
++    for (i = 0; i < sizeof(map) / sizeof(map[0]); i++)
++        if (changed & (1u << map[i].id))
++            zx_key_send(map[i].key, (m >> map[i].id) & 1);
++
++    prev = m;
++}
++
+ /* ------------------------------------------------------------------ pausa --- */
+ 
+ void zx_set_paused(bool paused)
+@@ -1167,6 +1344,26 @@
+     if (zx_paused)
+         return;
+ 
++    /* Menu: abre por F8 (zx_menu_wanted) ou se o proprio engine pediu
++     * (menu_abierto). Enquanto estiver aberto a CPU nao roda. */
++    if (zx_menu_alive)
++    {
++        zx_menu_reap();
++        if (zx_menu_alive && !zx_menu_osd)
++            return;            /* menu normal: CPU parada */
++    }
++    else if (zx_osd_wanted)
++    {
++        zx_osd_wanted = 0;
++        zx_menu_start(1);      /* teclado virtual: segue emulando neste quadro */
++    }
++    else if (zx_menu_wanted || menu_abierto)
++    {
++        zx_menu_wanted = 0;
++        if (zx_menu_start(0))
++            return;
++    }
++
+     /* "Passaram 20 ms": o frontend E' o relogio.
+      *
+      * Aqui so falta LIGAR a interrupcao de 50 Hz deste quadro. Quem decide
+@@ -1211,7 +1408,8 @@
+                     guarda, esperando_tiempo_final_t_estados.v);
+ #endif
+ cpu_core_loop();
+-    } while (++guarda < 2000000 && esperando_tiempo_final_t_estados.v == 0);
++    } while (++guarda < 2000000 && esperando_tiempo_final_t_estados.v == 0
++             && (zx_menu_osd || !menu_abierto));
+     }
+ 
+ #ifdef ZX_TRACE_CAIXA
+@@ -1257,6 +1455,14 @@
+     if (!zx_started || zx_paused)
+         return 0;
+ 
++    /* Menu aberto: a CPU nao produz audio; entrega silencio para o frontend
++     * nao ficar sem amostras. */
++    if (zx_menu_alive && !zx_menu_osd)
++    {
++        memset(out, 0, max_frames * 2 * sizeof(int16_t));
++        return max_frames;
++    }
++
+     return snd_libretro_read(out, max_frames);
+ }
+ 
+@@ -1302,6 +1508,19 @@
+     }
+ }
+ 
++/* Teclas que so fazem sentido DENTRO do menu (ESC volta, PgUp/PgDn no seletor
++ * de arquivos). Fora do menu continuam sem mapa, como antes. */
++static int zx_map_key_menu(unsigned k)
++{
++    switch (k)
++    {
++        case RETROK_ESCAPE:   return UTIL_KEY_ESC;
++        case RETROK_PAGEUP:   return UTIL_KEY_PAGE_UP;
++        case RETROK_PAGEDOWN: return UTIL_KEY_PAGE_DOWN;
++        default:              return -1;
++    }
++}
++
+ void zx_set_key(unsigned retro_keycode, bool down)
+ {
+     int k;
+@@ -1309,11 +1528,22 @@
+     if (!zx_started || zx_paused)
+         return;
+ 
++    /* F8 abre o menu. Nao passa pelo mapa nem por util_set_reset_key: o
++     * glue abre o menu por conta propria (ver zx_run_frame). */
++    if (retro_keycode == ZX_MENU_HOTKEY)
++    {
++        if (down && !zx_menu_alive)
++            zx_menu_wanted = 1;
++        return;
++    }
++
+     k = zx_map_key(retro_keycode);
++    if (k < 0 && zx_menu_alive)
++        k = zx_map_key_menu(retro_keycode);
+     if (k < 0)
+         return;
+ 
+-    util_set_reset_key((enum util_teclas)k, down ? 1 : 0);
++    zx_key_send(k, down ? 1 : 0);
+ }
+ 
+ /* So reagimos a MUDANCAS: o RetroArch chama retro_run 50 vezes por segundo e
+@@ -1327,6 +1557,22 @@
+     if (port != 0 || !zx_started || zx_paused)
+         return;
+ 
++    /* Botao X: abre o teclado virtual (so na borda de subida, e so se nenhum
++     * menu estiver aberto). */
++    {
++        static int x_prev;
++        int x = (m >> RETRO_DEVICE_ID_JOYPAD_X) & 1;
++        if (x && !x_prev && !zx_menu_alive)
++            zx_osd_wanted = 1;
++        x_prev = x;
++    }
++
++    if (zx_menu_alive)
++    {
++        zx_menu_joy(m);   /* o joypad navega o menu, nao o Spectrum */
++        return;
++    }
++
+     changed = (uint16_t)(m ^ prev);
+     if (!changed)
+         return;
+--- a/libretro.c	2026-10-02 16:04:53.339640358 +0000
++++ b/libretro.c	2026-10-02 16:04:53.408072495 +0000
+@@ -337,6 +337,9 @@
+ /* Loop principal: UM frame por chamada                                     */
+ /* ------------------------------------------------------------------------ */
+ extern void zx_libretro_zoom_next(void);
++extern bool zx_menu_active(void);   /* zesarux_glue.c */
++extern void zx_fb_lock(void);
++extern void zx_fb_unlock(void);
+ 
+ void retro_run(void)
+ {
+@@ -390,16 +393,17 @@
+          static int sel_prev;
+          int start = (mask >> RETRO_DEVICE_ID_JOYPAD_START) & 1;
+          int sel   = (mask >> RETRO_DEVICE_ID_JOYPAD_SELECT) & 1;
++         int menu  = zx_menu_active();   /* menu aberto: Start/Select nao valem */
+ 
+          /* Start: avanca o zoom 1x/2x/3x (so na borda de subida). */
+-         if (start && !start_prev)
++         if (start && !start_prev && !menu)
+             zx_libretro_zoom_next();
+          start_prev = start;
+ 
+          /* Select: reset (so na borda de subida, para nao resetar a cada
+           * quadro enquanto o botao estiver pressionado). Usa o mesmo reset
+           * suave do retro_reset(). */
+-         if (sel && !sel_prev)
++         if (sel && !sel_prev && !menu)
+             zx_reset(false);
+          sel_prev = sel;
+       }
+@@ -435,10 +439,14 @@
+ #ifdef ZX_TRACE
+    QueryPerformanceCounter(&q3);
+ #endif
++   /* A thread do menu desenha no mesmo framebuffer: o lock cobre a copia que
++    * o frontend faz dentro de video_cb. */
++   zx_fb_lock();
+    if (fb)
+       video_cb(fb, w, h, pitch);
+    else
+       video_cb(NULL, w, h, pitch); /* repete o frame anterior */
++   zx_fb_unlock();
+ #ifdef ZX_TRACE
+    QueryPerformanceCounter(&q4);
+ #endif
