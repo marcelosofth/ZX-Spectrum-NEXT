@@ -1,0 +1,160 @@
+﻿<#
+ .SYNOPSIS
+   Compila o core libretro do ZEsarUX (ZX Spectrum Next) para Windows.
+
+ .DESCRIPTION
+   Produz zesarux_libretro.dll a partir de 174 objetos do ZEsarUX + os
+   arquivos novos do port.
+
+   As TRES coisas abaixo nao sao obvias e custaram horas de erro:
+
+   1) -Wl,--export-all-symbols e obrigatorio. Sem ele a DLL linka mas nao
+      exporta nada, e o RetroArch nao acha o core. A alternativa seria um
+      version script (EXPORTS ...), mas isso e' sintaxe ELF e o ld do MinGW,
+      que tem alvo PE, rejeita com "syntax error".
+
+   2) -include windows.h e obrigatorio porque utils.c (cpu.c:52) inclui
+      <winbase.h> sozinho, e winbase.h pressupoe que windows.h ja foi
+      carregado. Sem isso: "unknown type name 'DWORD'".
+
+   3) -DZESARUX_LIBRETRO precisa estar em TODOS os objetos, nao so nos que
+      usam o patch. Ela controla o return em timer_pause_waiting_end_frame()
+      (timer.c), que tira um sleep de ~15 ms por quadro no Windows.
+
+   E o motivo de o script existir: o build manual depende deeerè¿™å‡ ä¸ª flags na
+   ordem certa, e errar um deles da um binario que linka e nao funciona.
+
+ .PARAMETER Debug
+   Com -Trace, compila com -O0 -g e liga ZX_TRACE (imprime passos por quadro
+   em stderr). Sem ele, -O2 -DNDEBUG e sem trace.
+
+ .EXAMPLE
+   .\build_win.ps1
+   .\build_win.ps1 -Trace
+#>
+[CmdletBinding()]
+param(
+    [switch]$Trace,
+    [switch]$Install
+)
+
+$ErrorActionPreference = 'Stop'
+
+# O Mingw tem que estar no PATH. Depender do PATH da sessao foi a causa de
+# vários erros hoje ("gcc.exe não é reconhecido"), então o script garante.
+$MinGW = 'C:\msys64\mingw64\bin'
+if (-not ($env:Path -split ';' -contains $MinGW)) {
+    $env:Path = "$MinGW;$env:Path"
+}
+$env:Path = "C:\msys64\usr\bin;$env:Path"   # objdump, para a conferencia de exports
+
+$Proj = Split-Path -Parent $PSScriptRoot
+$Src  = Join-Path $Proj 'zesarux-src'
+$Zig  = 'C:\Users\Marcelo\AppData\Local\Temp\opencode\zigroot\zig-x86_64-windows-0.16.0\zig.exe'
+$ObjDir = Join-Path $Proj 'obj-win'
+$Dll  = Join-Path $Proj 'dist\zesarux_libretro.dll'
+
+if ($Trace) {
+    Write-Host "modo: DEBUG (-O0 -g, ZX_TRACE ligado)" -ForegroundColor Yellow
+    $Opt = @('-O0', '-g', '-DZX_TRACE')
+} else {
+    Write-Host "modo: PRODUCAO (-O2 -DNDEBUG)" -ForegroundColor Green
+    $Opt = @('-O2', '-DNDEBUG', '-DZX_TRACE_CAIXA')
+}
+
+$Comum = @(
+    '-DMINGW'
+    '-DMAX_PATH=260'        # zesarux.h usa MAX_PATH sem incluir windows.h
+    '-DZESARUX_LIBRETRO'    # tira o sleep do fim de quadro
+    '-include', 'unistd.h'  # zesarux.h pula <unistd.h> com MINGW, mas chama sleep()
+    '-include', 'windows.h' # winbase.h precisa do windows.h antes
+    '-fsigned-char'
+) + $Opt + @(
+    '-I.', '-I..', '-I..\scr', '-Iaudio', '-Icopy_interfaces', '-Icores', '-Icpus',
+    '-Imachines', '-Imenu', '-Isnap', '-Istorage', '-Isoundchips',
+    '-Ithird_party', '-Ivideo', '-Ivideo_chips', '-Izrcp', '-Izxvision'
+)
+
+# --- 1. as 174 fontes do ZEsarUX, extraidas do Makefile que o configure embute
+$base = Get-Content (Join-Path $PSScriptRoot 'Makefile.base')
+$fases = @()
+foreach ($linha in $base) {
+    if ($linha -match '^\s*#') { continue }          # regra comentada (ex.: 68000.c)
+    if ($linha -match '^\s*\\\$\(CC\)\s') {          # so as linhas de compilacao
+        # algumas regras compilam varios .c num .o: pega todos, nao so o primeiro
+        foreach ($m in [regex]::Matches($linha, '(\S+\.c)(?=\s|$)')) { $fases += $m.Groups[1].Value }
+    }
+}
+# other_sources_not_ZEsarUX/ sao ferramentas avulsas (sp_z80, etc), nao o emulador
+$fases = $fases | Where-Object { $_ -notlike 'other_sources_not_ZEsarUX*' } | Select-Object -Unique
+
+Write-Host "fontes do ZEsarUX: $($fases.Count)"
+New-Item -ItemType Directory -Path $ObjDir -Force | Out-Null
+Set-Location $Src
+
+# Durante a compilacao o erro NAO pode ser fatal. Com ErrorActionPreference
+# = 'Stop', qualquer linha de stderr -- inclusive um aviso legitimo do gcc --
+# aborta o script antes do exit code ser conferido. Foi o que aconteceu com
+# zxvision.h:30, que so emite aviso. O criterio de falha e o exit code.
+$ErrorActionPreference = 'Continue'
+
+$falhas = @()
+$sw = [Diagnostics.Stopwatch]::StartNew()
+foreach ($f in $fases) {
+    $o = Join-Path $ObjDir (($f -replace '\.c$','.o') -replace '/','_')
+    & gcc.exe @Comum -c $f -o $o 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $falhas += $f }
+}
+$sw.Stop()
+Write-Host ("  compilados em {0:N0}s, falhas: {1}" -f $sw.Elapsed.TotalSeconds, $falhas.Count)
+if ($falhas) { $falhas | ForEach-Object { Write-Host "    FALHA $_" -ForegroundColor Red } ; exit 1 }
+
+# --- 2. os 4 arquivos novos do port
+Write-Host "arquivos do port:"
+$novos = @(
+    ,@('..\scr\zesarux_glue.c',     'glue_win.o')
+    ,@('video\scr_libretro.c', 'scr_win.o')
+    ,@('audio\snd_libretro.c', 'snd_win.o')
+    ,@('..\scr\libretro.c',        'libretro_win.o')
+)
+foreach ($n in $novos) {
+    $log = & gcc.exe @Comum -c $n[0] -o (Join-Path $ObjDir $n[1]) 2>&1
+    $log | Select-String 'error' | Select-Object -First 3 |
+        ForEach-Object { Write-Host "    ERRO $($_.Line)" -ForegroundColor Red }
+    if ($LASTEXITCODE -ne 0) { Write-Host "    FALHA ao compilar $($n[0])" -ForegroundColor Red; exit 1 }
+    Write-Host "  ok $($n[0])"
+}
+
+# --- 3. linka
+Write-Host "linkando..."
+$objs = (Get-ChildItem $ObjDir -Filter '*.o' -File |
+         Where-Object { $_.Name -notmatch 'scr_win|snd_win|glue_win|libretro_win' } |
+         ForEach-Object { $_.FullName })
+$objs += @(
+    (Join-Path $ObjDir 'scr_win.o'), (Join-Path $ObjDir 'snd_win.o'),
+    (Join-Path $ObjDir 'glue_win.o'), (Join-Path $ObjDir 'libretro_win.o')
+)
+Write-Host "  objetos: $($objs.Count)"
+
+Remove-Item $Dll -Force -ErrorAction SilentlyContinue
+& g++.exe -shared -static-libgcc -static-libstdc++ `
+    '-Wl,--export-all-symbols' -o $Dll @objs -lwinmm -lm 2>&1 |
+    Select-String 'error' | Select-Object -First 4 |
+    ForEach-Object { Write-Host "    LINK $_" -ForegroundColor Red }
+if ($LASTEXITCODE -ne 0) { Write-Host "falha no link" -ForegroundColor Red; exit 1 }
+
+$sz = (Get-Item $Dll).Length
+Write-Host ""
+Write-Host ("DLL: {0:N0} bytes   {1}" -f $sz, $Dll) -ForegroundColor Green
+
+# --- 4. confere se exporta a API (a falha silenciosa mais comum)
+$falta = (& objdump.exe -p $Dll 2>&1 | Select-String 'retro_' | Measure-Object).Count
+Write-Host "exporta $falta linhas com retro_*"
+if ($falta -lt 25) { Write-Host "  AVISO: esperado 25 simbolos da API" -ForegroundColor Yellow }
+
+if ($Install) {
+    $dest = 'F:\Emulators\RetroArch\cores'
+    Copy-Item $Dll (Join-Path $dest 'zesarux_libretro.dll') -Force
+    Remove-Item (Join-Path $dest '..\info\core_info.cache') -Force -ErrorAction SilentlyContinue
+    Write-Host "instalado em $dest" -ForegroundColor Green
+}

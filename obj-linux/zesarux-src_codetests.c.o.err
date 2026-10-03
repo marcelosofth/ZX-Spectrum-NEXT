@@ -1,0 +1,5 @@
+In file included from G:/Internet_Temp/Batocera_add/Projetos/next/zesarux-src/codetests.c:50:
+G:/Internet_Temp/Batocera_add/Projetos/next/zesarux-src/network.h:40:18: fatal error: sys/socket.h: No such file or directory
+   40 |         #include <sys/socket.h>
+      |                  ^~~~~~~~~~~~~~
+compilation terminated.

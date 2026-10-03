@@ -1,0 +1,4 @@
+G:/Internet_Temp/Batocera_add/Projetos/next/zesarux-src/audio/audio_ayplayer.c: In function 'ay_player_add_directory_playlist':
+G:/Internet_Temp/Batocera_add/Projetos/next/zesarux-src/audio/audio_ayplayer.c:1307:13: error: implicit declaration of function 'scandir' [-Wimplicit-function-declaration]
+ 1307 |         n = scandir(".", &namelist, ay_player_add_directory_playlist_filter_func, ay_player_add_directory_playlist_alphasort);
+      |             ^~~~~~~
